@@ -1,5 +1,12 @@
 # isomdl
 
+> [!IMPORTANT]
+> This is ElevenID's downstream maintenance fork of
+> [spruceid/isomdl](https://github.com/spruceid/isomdl). It carries small,
+> reviewed compatibility and security patches required by Marty. A scheduled
+> workflow proposes upstream changes as pull requests for review; it never
+> merges upstream code automatically. See [DOWNSTREAM.md](DOWNSTREAM.md).
+
 [ISO/IEC DIS 18013-5](https://www.iso.org/standard/69084.html) `mDL` implementation in Rust.
 
 It is intended to be used in creating apps for devices and readers that can interact with each other to exchange `mDL`

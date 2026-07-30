@@ -1,0 +1,109 @@
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "17 6 13 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    name: Propose upstream changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SYNC_BRANCH: automation/upstream-sync
+      UPSTREAM_REPOSITORY: https://github.com/spruceid/isomdl.git
+      UPSTREAM_BRANCH: main
+    steps:
+      - name: Checkout maintained fork
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create or refresh upstream pull request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "ElevenID upstream sync"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPOSITORY"
+          git fetch --no-tags origin main
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" origin/main; then
+            echo "The maintained fork already contains upstream/$UPSTREAM_BRANCH."
+            exit 0
+          fi
+
+          git switch --force-create "$SYNC_BRANCH" origin/main
+          if ! git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            git merge --abort
+            run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            title="Upstream sync needs manual conflict resolution"
+            issue_number="$(
+              gh issue list \
+                --state open \
+                --search "\"$title\" in:title" \
+                --json number \
+                --jq '.[0].number // empty'
+            )"
+            if [[ -z "$issue_number" ]]; then
+              gh issue create \
+                --title "$title" \
+                --body "The monthly sync from spruceid/isomdl could not be merged cleanly. Resolve it manually and run the complete fork test suite. Diagnostic run: $run_url"
+            else
+              gh issue comment "$issue_number" \
+                --body "The upstream sync still conflicts. Diagnostic run: $run_url"
+            fi
+            exit 1
+          fi
+
+          expected="$(
+            git ls-remote origin "refs/heads/$SYNC_BRANCH" |
+              awk '{ print $1 }'
+          )"
+          lease="refs/heads/$SYNC_BRANCH:${expected}"
+          git push \
+            --force-with-lease="$lease" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$SYNC_BRANCH"
+
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          pr_number="$(
+            gh pr list \
+              --state open \
+              --head "$SYNC_BRANCH" \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          body="$(
+            printf '%s\n\n%s\n\n%s\n' \
+              'Automated monthly proposal to merge spruceid/isomdl `main` into the maintained ElevenID fork.' \
+              'This pull request is never merged automatically. Review the upstream delta and require the complete CI/security suite before merging.' \
+              "Workflow run: $run_url"
+          )"
+          if [[ -z "$pr_number" ]]; then
+            gh pr create \
+              --base main \
+              --head "$SYNC_BRANCH" \
+              --title "Sync spruceid/isomdl upstream" \
+              --body "$body"
+          else
+            gh api \
+              --method PATCH \
+              "repos/$GH_REPO/pulls/$pr_number" \
+              --field body="$body" >/dev/null
+          fi
