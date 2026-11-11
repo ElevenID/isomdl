@@ -559,6 +559,387 @@ pub(crate) fn setup_with_crl_url(
     (pki.root, pki.leaf, pki.root_key, pki.issuer)
 }
 
+mod chain_authorization {
+    use const_oid::AssociatedOid;
+    use der::Encode;
+    use x509_cert::ext::pkix::{
+        constraints::name::GeneralSubtree, CertificatePolicies, InhibitAnyPolicy, NameConstraints,
+        PolicyConstraints, PolicyMappings, PrivateKeyUsagePeriod,
+    };
+
+    use super::*;
+
+    fn extension<T: AssociatedOid + Encode>(value: &T, critical: bool) -> Extension {
+        Extension {
+            extn_id: T::OID,
+            critical,
+            extn_value: OctetString::new(value.to_der().unwrap()).unwrap(),
+        }
+    }
+
+    fn resign(certificate: &mut Certificate, issuer_key: &p256::ecdsa::SigningKey) {
+        let signature: ecdsa::Signature<NistP256> =
+            issuer_key.sign(&certificate.tbs_certificate.to_der().unwrap());
+        certificate.signature = signature.to_der().to_bitstring().unwrap();
+    }
+
+    fn change_issuer(
+        certificate: &mut Certificate,
+        issuer: &Certificate,
+        issuer_key: &p256::ecdsa::SigningKey,
+    ) {
+        certificate.tbs_certificate.issuer = issuer.tbs_certificate.subject.clone();
+        let (_, key_identifier) = issuer
+            .tbs_certificate
+            .get::<SubjectKeyIdentifier>()
+            .unwrap()
+            .unwrap();
+        let extensions = certificate.tbs_certificate.extensions.as_mut().unwrap();
+        extensions.retain(|e| e.extn_id != AuthorityKeyIdentifier::OID);
+        extensions.push(extension(
+            &AuthorityKeyIdentifier {
+                key_identifier: Some(key_identifier.0),
+                ..Default::default()
+            },
+            false,
+        ));
+        resign(certificate, issuer_key);
+    }
+
+    fn intermediate(pki: &TestPki, path_len: Option<u8>) -> Certificate {
+        let mut certificate = pki.leaf.clone();
+        let extensions = certificate.tbs_certificate.extensions.as_mut().unwrap();
+        extensions.retain(|e| e.extn_id != CertificatePolicies::OID && e.extn_id != KeyUsage::OID);
+        extensions.push(extension(
+            &BasicConstraints {
+                ca: true,
+                path_len_constraint: path_len,
+            },
+            true,
+        ));
+        extensions.push(extension(&KeyUsage(KeyUsages::KeyCertSign.into()), true));
+        resign(&mut certificate, &pki.root_key);
+        assert!(validation::signature::issuer_signed_subject(
+            &certificate,
+            &pki.root
+        ));
+        certificate
+    }
+
+    fn ncp_leaf(issuer: &Certificate, issuer_key: &p256::ecdsa::SigningKey) -> Certificate {
+        let leaf_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let mut prepared = prepare_etsi_style_signer_certificate(
+            &leaf_key,
+            issuer_key,
+            issuer.tbs_certificate.subject.clone(),
+            default_validity(),
+            validation::NCP_POLICY_OID,
+        );
+        let signature: ecdsa::Signature<NistP256> = issuer_key.sign(&prepared.finalize().unwrap());
+        let certificate = prepared
+            .assemble(signature.to_der().to_bitstring().unwrap())
+            .unwrap();
+        assert!(validation::signature::issuer_signed_subject(
+            &certificate,
+            issuer
+        ));
+        certificate
+    }
+
+    async fn validate_chain(
+        certificates: &[Certificate],
+        anchor: &Certificate,
+    ) -> validation::ValidationOutcome {
+        let mut builder = X5Chain::builder();
+        for certificate in certificates {
+            builder = builder.with_certificate(certificate.clone()).unwrap();
+        }
+        let chain = builder.build().unwrap();
+        let registry = trust_anchor::TrustAnchorRegistry {
+            anchors: vec![trust_anchor::TrustAnchor {
+                certificate: anchor.clone(),
+                purpose: trust_anchor::TrustPurpose::Iaca,
+            }],
+        };
+        validation::validate(
+            &validation::EuAgeVerificationProfile,
+            &chain,
+            &registry,
+            &(),
+        )
+        .await
+    }
+
+    fn assert_rejected(outcome: &validation::ValidationOutcome, reason: &str) {
+        assert!(!outcome.success(), "expected {reason}: {outcome:?}");
+        assert!(
+            outcome.errors.iter().any(|error| error.contains(reason)),
+            "expected {reason}: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_document_signer_cannot_act_as_an_intermediate_ca() {
+        let pki = TestPki::etsi_av();
+        let forged = ncp_leaf(&pki.leaf, &pki.leaf_key);
+        let outcome = validate_chain(&[forged, pki.leaf.clone()], &pki.root).await;
+        assert!(
+            !outcome.success(),
+            "an untrusted non-CA signed a new leaf: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_authorized_intermediate_works_with_external_and_in_chain_anchors() {
+        let pki = TestPki::etsi_av();
+        let ca = intermediate(&pki, Some(0));
+        let leaf = ncp_leaf(&ca, &pki.leaf_key);
+        for certificates in [
+            vec![leaf.clone(), ca.clone()],
+            vec![leaf.clone(), ca.clone(), pki.root.clone()],
+        ] {
+            let outcome = validate_chain(&certificates, &pki.root).await;
+            assert!(outcome.success(), "{outcome:?}");
+        }
+        // The end-entity does not consume a CA's pathLenConstraint of zero.
+        // RFC 5280 allows an absent KeyUsage; a present one must authorize signing.
+        let mut ca_without_key_usage = ca.clone();
+        ca_without_key_usage
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .retain(|e| e.extn_id != KeyUsage::OID);
+        resign(&mut ca_without_key_usage, &pki.root_key);
+        let outcome = validate_chain(&[leaf, ca_without_key_usage], &pki.root).await;
+        assert!(outcome.success(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn intermediate_authorization_extensions_fail_closed() {
+        let pki = TestPki::etsi_av();
+        let ca = intermediate(&pki, Some(0));
+        let leaf = ncp_leaf(&ca, &pki.leaf_key);
+        let mut variants = Vec::new();
+        let mut missing_constraints = ca.clone();
+        missing_constraints
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .retain(|e| e.extn_id != BasicConstraints::OID);
+        variants.push((missing_constraints, "requires BasicConstraints CA:true"));
+        for (value, reason) in [
+            (
+                extension(
+                    &BasicConstraints {
+                        ca: false,
+                        path_len_constraint: None,
+                    },
+                    true,
+                ),
+                "BasicConstraints CA:true",
+            ),
+            (
+                extension(&KeyUsage(KeyUsages::DigitalSignature.into()), true),
+                "does not permit keyCertSign",
+            ),
+            (
+                Extension {
+                    extn_id: BasicConstraints::OID,
+                    critical: true,
+                    extn_value: OctetString::new([0x05, 0x00]).unwrap(),
+                },
+                "BasicConstraints cannot be decoded",
+            ),
+            (
+                Extension {
+                    extn_id: KeyUsage::OID,
+                    critical: true,
+                    extn_value: OctetString::new([0x05, 0x00]).unwrap(),
+                },
+                "KeyUsage cannot be decoded",
+            ),
+        ] {
+            let mut variant = ca.clone();
+            let extensions = variant.tbs_certificate.extensions.as_mut().unwrap();
+            extensions.retain(|e| e.extn_id != value.extn_id);
+            extensions.push(value);
+            variants.push((variant, reason));
+        }
+        let mut duplicate = ca.clone();
+        duplicate
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(extension(
+                &BasicConstraints {
+                    ca: true,
+                    path_len_constraint: Some(0),
+                },
+                true,
+            ));
+        variants.push((duplicate, "duplicate extension"));
+        let mut v2 = ca.clone();
+        v2.tbs_certificate.version = Version::V2;
+        variants.push((v2, "must be a V3 CA"));
+        for (mut variant, reason) in variants {
+            resign(&mut variant, &pki.root_key);
+            assert!(validation::signature::issuer_signed_subject(
+                &variant, &pki.root
+            ));
+            let outcome = validate_chain(&[leaf.clone(), variant], &pki.root).await;
+            assert_rejected(&outcome, reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_signatures_do_not_replace_issuer_name_binding() {
+        let pki = TestPki::etsi_av();
+        let ca = intermediate(&pki, Some(0));
+        let mut leaf = ncp_leaf(&ca, &pki.leaf_key);
+        leaf.tbs_certificate.issuer = "CN=different issuer,C=US".parse().unwrap();
+        resign(&mut leaf, &pki.leaf_key);
+        assert!(validation::signature::issuer_signed_subject(&leaf, &ca));
+        let outcome = validate_chain(&[leaf, ca], &pki.root).await;
+        assert_rejected(&outcome, "issuer name does not match");
+    }
+
+    #[tokio::test]
+    async fn path_length_counts_subordinate_non_self_issued_cas() {
+        let pki = TestPki::etsi_av();
+        let lower_pki = TestPki::etsi_av();
+        let mut upper = intermediate(&pki, Some(0));
+        let mut lower = intermediate(&lower_pki, Some(0));
+        lower.tbs_certificate.subject = "CN=lower CA,C=US".parse().unwrap();
+        change_issuer(&mut lower, &upper, &pki.leaf_key);
+        let leaf = ncp_leaf(&lower, &lower_pki.leaf_key);
+        let outcome =
+            validate_chain(&[leaf.clone(), lower.clone(), upper.clone()], &pki.root).await;
+        assert_rejected(&outcome, "pathLenConstraint 0 exceeded by 1");
+
+        let extensions = upper.tbs_certificate.extensions.as_mut().unwrap();
+        extensions.retain(|e| e.extn_id != BasicConstraints::OID);
+        extensions.push(extension(
+            &BasicConstraints {
+                ca: true,
+                path_len_constraint: Some(1),
+            },
+            true,
+        ));
+        resign(&mut upper, &pki.root_key);
+        let outcome = validate_chain(&[leaf.clone(), lower.clone()], &upper).await;
+        // Explicitly configured anchors do not inherit intermediate constraints.
+        assert!(outcome.success(), "{outcome:?}");
+        let outcome = validate_chain(&[leaf, lower, upper], &pki.root).await;
+        assert!(outcome.success(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_self_issued_key_rollover_does_not_consume_path_length() {
+        let pki = TestPki::etsi_av();
+        let rollover_pki = TestPki::etsi_av();
+        let upper = intermediate(&pki, Some(0));
+        let mut rollover = intermediate(&rollover_pki, Some(0));
+        rollover.tbs_certificate.subject = upper.tbs_certificate.subject.clone();
+        change_issuer(&mut rollover, &upper, &pki.leaf_key);
+        let leaf = ncp_leaf(&rollover, &rollover_pki.leaf_key);
+        let outcome = validate_chain(&[leaf, rollover, upper], &pki.root).await;
+        assert!(outcome.success(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn unsupported_constraints_and_critical_extensions_are_not_ignored() {
+        let pki = TestPki::etsi_av();
+        let ca = intermediate(&pki, Some(0));
+        let leaf = ncp_leaf(&ca, &pki.leaf_key);
+        let names = NameConstraints {
+            permitted_subtrees: None,
+            excluded_subtrees: Some(vec![GeneralSubtree {
+                base: GeneralName::DirectoryName(leaf.tbs_certificate.subject.clone()),
+                minimum: 0,
+                maximum: None,
+            }]),
+        };
+        let policies = PolicyConstraints {
+            require_explicit_policy: Some(0),
+            inhibit_policy_mapping: None,
+        };
+        for value in [
+            extension(&names, true),
+            extension(&names, false),
+            extension(&policies, false),
+        ] {
+            let mut constrained = ca.clone();
+            constrained
+                .tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .push(value);
+            resign(&mut constrained, &pki.root_key);
+            let outcome = validate_chain(&[leaf.clone(), constrained], &pki.root).await;
+            assert_rejected(&outcome, "unsupported constraint or critical extension");
+        }
+        // Reject the other unsupported constraint families regardless of their critical bit;
+        // even a malformed or empty value must never be treated as unconstrained.
+        for oid in [
+            CertificatePolicies::OID,
+            PolicyMappings::OID,
+            InhibitAnyPolicy::OID,
+            ExtendedKeyUsage::OID,
+            PrivateKeyUsagePeriod::OID,
+        ] {
+            let mut constrained = ca.clone();
+            constrained
+                .tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .push(Extension {
+                    extn_id: oid,
+                    critical: false,
+                    extn_value: OctetString::new([0x05, 0x00]).unwrap(),
+                });
+            resign(&mut constrained, &pki.root_key);
+            let outcome = validate_chain(&[leaf.clone(), constrained], &pki.root).await;
+            assert_rejected(&outcome, "unsupported constraint or critical extension");
+        }
+        for critical in [false, true] {
+            let mut unknown = ca.clone();
+            unknown
+                .tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .push(Extension {
+                    extn_id: ObjectIdentifier::new_unwrap("1.2.3.4"),
+                    critical,
+                    extn_value: OctetString::new([0x05, 0x00]).unwrap(),
+                });
+            resign(&mut unknown, &pki.root_key);
+            let outcome = validate_chain(&[leaf.clone(), unknown], &pki.root).await;
+            if critical {
+                assert_rejected(&outcome, "unsupported constraint or critical extension");
+            } else {
+                assert!(outcome.success(), "{outcome:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicitly_configured_anchors_keep_their_profile_trust_semantics() {
+        let pki = TestPki::etsi_av();
+        let leaf = ncp_leaf(&pki.leaf, &pki.leaf_key);
+        // Trusted List membership is explicit trust, distinct from an untrusted non-CA.
+        for certificates in [vec![leaf.clone()], vec![leaf, pki.leaf.clone()]] {
+            let outcome = validate_chain(&certificates, &pki.leaf).await;
+            assert!(outcome.success(), "{outcome:?}");
+        }
+    }
+}
+
 mod iaca {
     use der::EncodePem;
 

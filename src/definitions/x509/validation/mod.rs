@@ -19,6 +19,7 @@ use super::{
     X5Chain,
 };
 
+mod chain;
 mod error;
 mod eu_age_verification;
 mod extensions;
@@ -452,6 +453,9 @@ pub enum ChainRule {
     EndEntityOnly,
     /// The chain is walked from end-entity towards root, verifying each link, until a
     /// certificate in it is a trust anchor or a trust anchor signs its last certificate.
+    /// Untrusted intermediates must be V3 CAs with suitable key usage and path length.
+    /// Unsupported name, policy and extended-key-usage constraints, and unknown critical
+    /// extensions, are rejected; this is not a general-purpose PKIX path validator.
     WalkToTrustAnchor,
 }
 
@@ -865,8 +869,8 @@ enum ChainToTrustAnchorResult<'a> {
 
 /// Validate that the certificate chain terminates at a trust anchor.
 ///
-/// Walks the chain from end-entity towards root, verifying signatures and checking
-/// if any certificate is a trust anchor or if a trust anchor signs the last certificate.
+/// Walks the chain from end-entity towards root, verifying names, signatures and each
+/// untrusted intermediate's CA authorization before accepting a configured trust anchor.
 ///
 /// Any validation errors (signature failures, validity issues) are recorded in `outcome`.
 fn validate_chain_to_trust_anchor<'a>(
@@ -877,11 +881,19 @@ fn validate_chain_to_trust_anchor<'a>(
     validation_time: OffsetDateTime,
 ) -> ChainToTrustAnchorResult<'a> {
     let certificates: Vec<_> = x5chain.iter().collect();
+    let mut non_self_issued_ca_count_below = 0;
 
     // Walk the chain from end-entity towards root, verifying each signature.
     for (i, window) in certificates.windows(2).enumerate() {
         let subject = &window[0].inner;
         let issuer = &window[1].inner;
+
+        if subject.tbs_certificate.issuer != issuer.tbs_certificate.subject {
+            outcome.errors.push(ErrorWithContext::chain(
+                "certificate issuer name does not match the next certificate's subject",
+            ));
+            return ChainToTrustAnchorResult::Invalid;
+        }
 
         // Verify the chain link signature first.
         if !issuer_signed_subject(subject, issuer) {
@@ -910,6 +922,16 @@ fn validate_chain_to_trust_anchor<'a>(
                 common_name_or_unknown(issuer)
             );
             return ChainToTrustAnchorResult::ValidInChainAnchor(issuer);
+        }
+
+        // The target end-entity is excluded. Self-issued CA certificates do not consume
+        // pathLenConstraint (RFC 5280 section 6.1.4), but still need CA authorization.
+        if let Err(error) = chain::validate_intermediate(issuer, non_self_issued_ca_count_below) {
+            outcome.errors.push(ErrorWithContext::chain(error));
+            return ChainToTrustAnchorResult::Invalid;
+        }
+        if issuer.tbs_certificate.subject != issuer.tbs_certificate.issuer {
+            non_self_issued_ca_count_below += 1;
         }
     }
 

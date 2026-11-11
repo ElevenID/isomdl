@@ -41,6 +41,12 @@ pub const NCP_POLICY_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("0.4.0
 /// `cRLDistributionPoints` produces a revocation *warning* rather than an error — "not
 /// checked" stays visible rather than being silently dropped.
 ///
+/// Intermediate certificates use the bounded checks of [`ChainRule::WalkToTrustAnchor`].
+/// Name, policy and extended-key-usage constraint propagation is not implemented, so
+/// intermediates carrying those constraints are rejected rather than treated as
+/// unconstrained. The configured Trusted List anchor itself retains the profile's
+/// explicit trust semantics.
+///
 /// # Reader certificates
 ///
 /// This is the issuer half only. The scheme's rules for relying-party certificates are not
