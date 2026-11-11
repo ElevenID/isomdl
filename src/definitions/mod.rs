@@ -22,6 +22,13 @@ pub use device_engagement::{
 pub use device_key::cose_key::{EC2Curve, Error, EC2Y};
 pub use device_key::{CoseKey, DeviceKeyInfo, KeyAuthorizations};
 pub use device_request::DocRequest;
+
+/// The ISO/IEC 18013-5 mobile driving licence doc type.
+pub const MDL_DOC_TYPE: &str = "org.iso.18013.5.1.mDL";
+
+/// The EUDI Person Identification Data doc type, which is also its namespace.
+pub const EUDI_PID_DOC_TYPE: &str = "eu.europa.ec.eudi.pid.1";
+
 pub use device_response::{DeviceResponse, Document};
 pub use device_signed::{DeviceAuth, DeviceSigned};
 pub use issuer_signed::{IssuerSigned, IssuerSignedItem};
